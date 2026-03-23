@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.streamlit/*
+!.streamlit/config.toml
+.data/
+.env

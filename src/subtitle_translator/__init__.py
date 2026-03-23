@@ -1,0 +1,1 @@
+"""Subtitle translator MVP package."""
