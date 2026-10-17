@@ -18,6 +18,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
+    "pytest-playwright>=0.7.0",
 ]
 
 [build-system]
@@ -31,3 +32,4 @@ packages = ["src/subtitle_translator"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["e2e: browser workflow tests"]
