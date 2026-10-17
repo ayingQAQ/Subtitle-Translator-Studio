@@ -25,10 +25,10 @@ class EncodingDetectionError(ValueError):
     """Raised when subtitle bytes cannot be decoded safely."""
 
 
-def detect_newline(data: bytes) -> str:
-    if b"\r\n" in data:
+def detect_newline(data: str) -> str:
+    if "\r\n" in data:
         return "\r\n"
-    if b"\r" in data:
+    if "\r" in data:
         return "\r"
     return "\n"
 
@@ -76,9 +76,17 @@ def _iter_encoding_candidates(data: bytes) -> list[str]:
     return normalized
 
 
-def decode_subtitle_bytes(data: bytes) -> DecodedText:
-    newline = detect_newline(data)
+def decode_subtitle_bytes(data: bytes, encoding: str | None = None) -> DecodedText:
+    if encoding:
+        try:
+            text = data.decode(encoding)
+        except (UnicodeError, LookupError) as exc:
+            raise EncodingDetectionError(f"Cannot decode file as {encoding}.") from exc
+        return DecodedText(text, encoding, detect_newline(text))
+    newline = "\n"
     bom_encoding = detect_bom_encoding(data)
+    if bom_encoding:
+        return decode_subtitle_bytes(data, bom_encoding)
     has_null_bytes = b"\x00" in data
 
     if not data:
@@ -102,7 +110,7 @@ def decode_subtitle_bytes(data: bytes) -> DecodedText:
         )
         if score > best_score:
             best_score = score
-            best_decoded = DecodedText(text=decoded_text, encoding=encoding, newline=newline)
+            best_decoded = DecodedText(text=decoded_text, encoding=encoding, newline=detect_newline(decoded_text))
 
     if best_decoded is not None:
         return best_decoded

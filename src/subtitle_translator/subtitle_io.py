@@ -6,7 +6,7 @@ from pathlib import Path
 from pysubs2 import SSAFile
 from pysubs2.exceptions import UnknownFPSError
 
-from subtitle_translator.encoding import can_encode, decode_subtitle_bytes, normalize_newlines
+from subtitle_translator.encoding import EncodingDetectionError, can_encode, decode_subtitle_bytes, normalize_newlines
 from subtitle_translator.models import ExportedSubtitle, SubtitleDocument, SubtitleSegment
 
 
@@ -59,7 +59,7 @@ def placeholders_are_preserved(candidate_text: str, token_count: int) -> bool:
     return placeholders == list(range(token_count))
 
 
-def load_subtitle_document(file_name: str, data: bytes) -> SubtitleDocument:
+def load_subtitle_document(file_name: str, data: bytes, encoding: str | None = None) -> SubtitleDocument:
     extension = Path(file_name).suffix.lower()
     if extension in IMAGE_SUBTITLE_EXTENSIONS:
         raise SubtitleIOError("Image-based subtitles are not supported in this MVP.")
@@ -68,7 +68,10 @@ def load_subtitle_document(file_name: str, data: bytes) -> SubtitleDocument:
     if format_identifier is None:
         raise SubtitleIOError(f"Unsupported subtitle file extension: {extension or '<none>'}")
 
-    decoded = decode_subtitle_bytes(data)
+    try:
+        decoded = decode_subtitle_bytes(data, encoding)
+    except EncodingDetectionError as exc:
+        raise SubtitleIOError(str(exc)) from exc
     parser_kwargs = {}
     if format_identifier in {"srt", "vtt"}:
         parser_kwargs.update(keep_html_tags=True, keep_unknown_html_tags=True)
