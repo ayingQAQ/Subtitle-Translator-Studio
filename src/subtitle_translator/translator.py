@@ -4,7 +4,7 @@ import html
 import json
 import re
 from dataclasses import dataclass, field
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Callable, Protocol
 from urllib.parse import urlparse
 
@@ -758,18 +758,24 @@ def _request_any_json(
     headers: dict[str, str] | None,
     json_payload: dict[str, object] | None = None,
 ) -> Any:
-    try:
-        response = httpx.request(
-            method=method,
-            url=url,
-            params=params,
-            json=json_payload,
-            headers=headers,
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise TranslationError(f"Provider request failed: {exc}") from exc
+    for attempt in range(3):
+        try:
+            response = httpx.request(
+                method=method, url=url, params=params, json=json_payload,
+                headers=headers, timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            break
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if attempt == 2 or (status != 429 and status < 500):
+                raise TranslationError(f'Provider HTTP error {status}. Check credentials, quota and endpoint.') from exc
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            if attempt == 2:
+                raise TranslationError(f'Provider network request failed ({type(exc).__name__}).') from exc
+        except httpx.HTTPError as exc:
+            raise TranslationError(f'Provider request failed ({type(exc).__name__}).') from exc
+        sleep(2 ** attempt)
 
     try:
         data = response.json()
@@ -821,6 +827,7 @@ class TranslationService:
         self._batch_size = max(1, batch_size)
         self._max_batch_chars = max(100, max_batch_chars)
         self.failures: dict[int, str] = {}
+        self._cancel_requested: Callable[[], bool] | None = None
         self._runtime_cache: dict[tuple[str, str, str], str] = {}
 
     def translate_document(
@@ -836,6 +843,7 @@ class TranslationService:
         translated_protected_texts: dict[int, str] = {}
         self._runtime_cache.clear()
         self.failures.clear()
+        self._cancel_requested = cancel_requested
         namespace = memory_identity(self._provider, glossary, document)
 
         work_segments = [
@@ -913,12 +921,20 @@ class TranslationService:
                     '\n'.join(s.plain_text for s in document.segments[last + 1:last + 3])[:1000],
                 )
             try:
-                batch_results = self._provider.translate_batch(
-                    batch_texts, source_language=source_language,
-                    target_language=target_language, glossary=relevant_glossary,
-                )
+                if len(batch_texts) == 1 and len(batch_texts[0]) > self._max_batch_chars:
+                    batch_results = [self._translate_segment_with_placeholder_fallback(
+                        batch_texts[0], source_language=source_language,
+                        target_language=target_language, glossary=relevant_glossary,
+                    )]
+                else:
+                    batch_results = self._provider.translate_batch(
+                        batch_texts, source_language=source_language,
+                        target_language=target_language, glossary=relevant_glossary,
+                    )
                 if len(batch_results) != len(batch_texts):
                     raise TranslationError('Provider returned an incorrect subtitle count.')
+            except TranslationCancelled:
+                raise
             except Exception as exc:
                 for text in batch_texts:
                     for segment in grouped_segments[text]:
@@ -937,6 +953,8 @@ class TranslationService:
                         )
                     if not placeholders_are_preserved(translated_text, token_count):
                         raise TranslationError('Protected tags were not preserved.')
+                except TranslationCancelled:
+                    raise
                 except Exception as exc:
                     for segment in grouped_segments[source_text]:
                         self.failures[segment.index] = str(exc) if isinstance(exc, TranslationError) else type(exc).__name__
@@ -984,12 +1002,15 @@ class TranslationService:
             leading = part[: len(part) - len(part.lstrip())]
             trailing = part[len(part.rstrip()) :]
             core = part.strip()
-            translated_core = self._provider.translate_batch(
-                [core],
-                source_language=source_language,
-                target_language=target_language,
-                glossary=glossary,
-            )[0]
+            translated_chunks = []
+            for chunk in text_chunks(core, self._max_batch_chars):
+                if self._cancel_requested and self._cancel_requested():
+                    raise TranslationCancelled('Cancelled. Completed subtitles have been saved.')
+                translated_chunks.append(self._provider.translate_batch(
+                    [chunk], source_language=source_language,
+                    target_language=target_language, glossary=glossary,
+                )[0])
+            translated_core = ''.join(translated_chunks)
             translated_lookup[part] = f"{leading}{translated_core}{trailing}"
 
         rebuilt = []
@@ -1014,6 +1035,17 @@ def bounded_batches(texts: list[str], max_items: int, max_chars: int):
         size += len(text)
     if batch:
         yield batch
+
+
+def text_chunks(text: str, limit: int):
+    while len(text) > limit:
+        cut = max(text.rfind(char, 0, limit) + 1 for char in '。！？.!? \n')
+        if cut < limit // 2:
+            cut = limit
+        yield text[:cut]
+        text = text[cut:]
+    if text:
+        yield text
 
 
 def _emit_progress(

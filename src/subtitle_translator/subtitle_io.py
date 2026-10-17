@@ -141,6 +141,18 @@ def build_output_file_name(original_file_name: str, target_language: str) -> str
     return f"{path.stem}.{target_language}{suffix}"
 
 
+def apply_subtitle_edits(document: SubtitleDocument, edits: dict[int, str]) -> None:
+    updates = {}
+    for index, raw in edits.items():
+        segment = document.segments[index]
+        protected, tokens = protect_subtitle_text(raw)
+        if tokens != segment.style_tokens:
+            raise SubtitleIOError(f'#{index + 1}: protected tags changed; keep original tags in order.')
+        if raw != (segment.translated_raw_text if segment.translated_raw_text is not None else segment.raw_text):
+            updates[index] = protected
+    apply_translated_segments(document, updates)
+
+
 def export_subtitle_document(document: SubtitleDocument, *, target_language: str) -> ExportedSubtitle:
     save_kwargs = {}
     if document.format == "srt":

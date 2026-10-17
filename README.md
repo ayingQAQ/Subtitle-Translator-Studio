@@ -8,6 +8,31 @@ This repository is a local single-user subtitle translation tool focused on tran
 
 ## 中文（简体）
 
+### 最新使用说明：恢复、编码、编辑与一键启动
+
+- **启动与停止**：双击 `start_subtitle_translator.bat`；不显示窗口时使用 `start_subtitle_translator_silent.vbs`。两个入口都使用 `launcher.py`，等待健康检查通过后才打开浏览器。重复启动复用本项目的已有服务。双击 `stop_subtitle_translator.bat` 停止服务。没有 PowerShell 启动脚本，也无需调整 PowerShell 执行策略。
+- **启动日志**：服务输出在 `.data/server.log`，启动失败原因在 `.data/launcher-error.log`。默认只监听 `127.0.0.1:8501`。其他程序占用端口时会报错，不会关闭其他程序。
+- **翻译恢复**：翻译在后台执行。可以取消；正在进行的请求结束后才会响应取消。已完成字幕保存在 `.data/jobs/` 的 JSON 检查点。失败项会列出，点击“继续未完成 / 仅重试失败项”只处理未完成行。重启后重新上传相同文件并使用相同配置，点击开始即可恢复。更换文件名、读取编码、接口、密钥、模型、语言或术语表会产生不同任务。
+- **部分下载**：失败或取消后仍能预览和下载，未完成行保留原文，并有部分结果提示。请在发布字幕前检查是否全部完成。
+- **编码检查**：上传后先检查原文预览；乱码时手动选择 UTF-8、UTF-8 BOM、CP932、GB18030、Big5 或 UTF-16。UTF-16 的换行在解码后识别。导出仍优先使用原编码，无法表示译文时回退到 UTF-8 BOM。
+- **模型与连接**：测试连接获取模型列表，列表按 Provider、接口地址和密钥指纹隔离。另有“试译一句”验证当前模型能否生成译文，这一步可能计费。无法列举模型的兼容服务仍可手动填模型名并试译。
+- **术语与记忆**：翻译记忆区分接口地址、术语表和提示版本；LLM 还区分原文上下文。更换术语表不会再误用原有配置的译文。原有旧命名空间记录不会删除，但新流程不会直接复用它们。
+- **速度与上下文**：同时限制每批条数和字符数，默认 `APP_BATCH_SIZE=20`、`APP_MAX_BATCH_CHARS=6000`；超长单条会拆分可见文本。LLM 会收到批次前后少量字幕作为只读上下文。临时网络错误和限流会有限重试；不再对任意失败都重复发送无 JSON 参数的请求。
+- **编辑译文**：可以在预览表编辑，或展开“按编号编辑字幕”使用文本框。点击应用后更新下载内容和检查点。样式标签与换行标记必须保留，否则拒绝应用。手工修改不写入全局翻译记忆，以免影响其他字幕。
+- **Windows 密钥保护**：Fernet 数据密钥通过当前 Windows 用户的 DPAPI 保护，旧的明文密钥文件读取时自动迁移；迁移后不能只复制这两个文件到其他账号或系统使用。非 Windows 环境使用权限收紧的 Fernet 密钥文件。任何平台都应保护 `.data/` 和 `.env`；字幕记忆与任务检查点包含可读字幕文本。
+- **清除密钥**：删除已保存密钥时同时清空当前输入、关闭自动记住并清空模型列表缓存。`.env` 中手动配置的密钥仍属于独立配置，下次新会话可能从该文件重新加载；要永久移除也应删除对应环境变量。
+
+开发验证：
+
+```powershell
+uv sync --locked --all-groups
+uv run playwright install chromium
+uv run pytest -m "not e2e"
+uv run pytest -m e2e --tracing retain-on-failure --screenshot only-on-failure
+```
+
+GitHub Actions 在推送和 PR 时运行 Windows/Linux 核心测试与 Linux Chromium 流程测试。浏览器测试使用本地模拟 API，无需真实密钥，不消耗付费余额；失败时上传截图与 trace。CI 通过不代表所有真实 Provider 或特效字幕都已验证。
+
 ### 0. 文档导览
 
 本 README 按以下顺序提供三种语言说明：
@@ -158,10 +183,10 @@ uv run streamlit run app.py
 特点：
 
 - 自动检查 `uv`
-- 首次自动 `uv sync --all-groups`
-- 若没有 `.env` 则自动从 `.env.example` 复制
+- 使用 `uv run --locked` 自动同步锁定依赖
+- `.env` 可选，也可在界面填写密钥
 - 自动打开浏览器
-- 保留终端日志窗口，便于排错
+- 启动器显示状态；服务日志写入 `.data/server.log`
 
 #### 6.2 双击启动（静默）
 
@@ -287,6 +312,8 @@ demo1_qwe/
   加密密钥文件路径（默认 `.data/secret_store.key`）
 - `APP_BATCH_SIZE`  
   批量翻译条数（默认 `20`）
+- `APP_MAX_BATCH_CHARS`
+  每批字幕文本字符数上限（默认 `6000`，最小 `100`）
 - `APP_MAX_FILE_SIZE_MB`  
   单文件大小上限 MB（默认 `5`）
 - `APP_REQUEST_TIMEOUT_SECONDS`  
@@ -341,11 +368,11 @@ source,target,notes
 
 - 明文不会直接写入配置文件
 - 使用 `cryptography.fernet` 加密后写入 `secret_store.enc`
-- 密钥保存在 `secret_store.key`
+- Windows 下 `secret_store.key` 保存由当前用户 DPAPI 保护的数据密钥；非 Windows 为 Fernet 密钥文件
 
 注意事项：
 
-- `secret_store.enc` 和 `secret_store.key` 需要同时保留
+- `secret_store.enc` 和 `secret_store.key` 需要同时保留；Windows 下还依赖原 Windows 用户的 DPAPI 环境
 - 如果 `secret_store.key` 丢失，历史加密内容无法解密
 - 建议将 `.data/` 目录加入备份或按需清理
 
@@ -440,6 +467,28 @@ uv run streamlit run app.py
 ---
 
 ## English
+
+### Updated workflow: recovery, encoding, editing and launch
+
+- **Launch/stop**: double-click `start_subtitle_translator.bat` or the silent `.vbs` entry. Both call `launcher.py`, wait for readiness and reuse an existing server from this project. Stop with `stop_subtitle_translator.bat`. No PowerShell script or execution-policy change is required. The server binds to loopback only. A port occupied by another process is reported, never terminated.
+- **Logs**: `.data/server.log` contains server output; `.data/launcher-error.log` records launcher failures.
+- **Recovery**: background jobs checkpoint completed lines in `.data/jobs/`. Cancel takes effect after the current request returns. Resume/retry processes unfinished lines only. After restarting, upload the same file with the same settings and start again to resume. A different filename, encoding, endpoint, key, model, language or glossary creates a different task. Partial downloads keep source text for unfinished lines and display a warning.
+- **Encoding**: check the source preview and override detection with UTF-8, UTF-8 BOM, CP932, GB18030, Big5 or UTF-16 when necessary. UTF-16 newlines are detected after decoding. Output falls back to UTF-8 BOM if the original encoding cannot represent the translation.
+- **Connections**: model lists are isolated by provider, endpoint and credential fingerprint. A separate sample-translation button verifies generation using the selected model and may incur cost. Manual model entry remains available for gateways without model listing.
+- **Memory and batching**: memory distinguishes endpoint, glossary and prompt version, plus source context for LLMs. Old namespace records remain on disk but are not reused by the new namespace. `APP_BATCH_SIZE=20` and `APP_MAX_BATCH_CHARS=6000` bound requests; oversized visible text is split. LLM requests include a small amount of neighboring source context. Transient HTTP failures receive bounded retries.
+- **Editing**: use the editable preview or expand “Edit one subtitle”. Apply updates to regenerate the download and save the checkpoint. Protected tags and newline markers must remain intact. Manual edits do not overwrite global translation memory.
+- **Credentials**: Windows protects the Fernet data key with current-user DPAPI and migrates legacy key files on read. Copying both files to a different account/system is insufficient after migration. Other platforms use a restricted-permission Fernet key file. Clearing credentials empties the current field, disables remembering and clears model cache; independently configured environment keys may reload in a new session. Translation memory/checkpoints contain readable subtitle text.
+
+Run verification:
+
+```powershell
+uv sync --locked --all-groups
+uv run playwright install chromium
+uv run pytest -m "not e2e"
+uv run pytest -m e2e --tracing retain-on-failure --screenshot only-on-failure
+```
+
+GitHub Actions runs Windows/Linux core checks and Linux Chromium workflows on pushes and pull requests. Browser tests use a local fake API without real credentials or paid calls. Failures retain screenshots and traces. These tests do not certify every live provider or subtitle effect.
 
 ### 0. Reading Order
 
@@ -630,6 +679,7 @@ App variables:
 - `APP_SECRET_STORE_PATH`
 - `APP_SECRET_KEY_PATH`
 - `APP_BATCH_SIZE`
+- `APP_MAX_BATCH_CHARS` (default `6000`, minimum `100`)
 - `APP_MAX_FILE_SIZE_MB`
 - `APP_REQUEST_TIMEOUT_SECONDS`
 
@@ -676,12 +726,12 @@ Safety:
 When “Remember API key (encrypted)” is enabled:
 
 - Keys are encrypted into `secret_store.enc`
-- Encryption key is stored in `secret_store.key`
+- `secret_store.key` contains the data key protected by current-user DPAPI on Windows; other platforms use a Fernet key file
 - Auto-fill works on next app start
 
 Important:
 
-- Keep both files together
+- Keep both files; Windows also requires the original user's DPAPI environment
 - Losing `secret_store.key` means old encrypted values cannot be decrypted
 
 ---
@@ -741,6 +791,28 @@ Unsupported file:
 ---
 
 ## 日本語
+
+### 更新された操作：再開・文字コード・編集・起動
+
+- **起動と停止**：`start_subtitle_translator.bat` または静かな `.vbs` を実行します。両方とも `launcher.py` を使用し、正常起動を確認してからブラウザを開きます。重複起動時は本プロジェクトの既存サーバーを再利用します。停止は `stop_subtitle_translator.bat`。PowerShell スクリプトや実行ポリシーの変更は不要です。ループバックのみで待ち受け、他のプロセスがポートを使用している場合は終了させずエラーを表示します。
+- **ログ**：サーバーログは `.data/server.log`、起動失敗は `.data/launcher-error.log` です。
+- **タスク再開**：バックグラウンド翻訳の完了行を `.data/jobs/` に保存します。中止は実行中リクエストの終了後に反映されます。再開ボタンは未完了行のみ処理します。再起動後も同じファイル・設定でアップロードして開始すると再開できます。ファイル名、文字コード、接続先、キー、モデル、言語、用語集が異なると別タスクになります。部分結果の未完了行は原文のままで、警告が表示されます。
+- **文字コード**：原文プレビューを確認し、必要なら UTF-8、UTF-8 BOM、CP932、GB18030、Big5、UTF-16 を選択します。UTF-16 の改行はデコード後に検出します。元の文字コードで書き出せない訳文は UTF-8 BOM に切り替えます。
+- **接続とモデル**：一覧キャッシュはプロバイダー・接続先・キーの指紋で分離します。別の試し翻訳ボタンで選択モデルの生成機能を確認できます。この操作は課金される場合があります。一覧 API のないサービスではモデル名を手動入力できます。
+- **メモリと速度**：翻訳メモリは接続先・用語集・プロンプト版で区別し、LLM では原文の文脈も区別します。旧メモリは削除せず、新しい名前空間では直接再利用しません。既定は `APP_BATCH_SIZE=20`、`APP_MAX_BATCH_CHARS=6000`。長すぎる可視テキストを分割し、LLM に前後の原文を少量渡します。一時的 HTTP エラーには回数制限付きで再試行します。
+- **編集**：プレビュー表または「番号で字幕を編集」から修正します。適用後、ダウンロードとチェックポイントを更新します。保護タグ・改行マーカーは維持してください。手動修正は全体の翻訳メモリを書き換えません。
+- **キー保護**：Windows では現在のユーザーの DPAPI で Fernet データキーを保護し、旧ファイルは読み込み時に移行します。移行後はファイルを別ユーザー・別システムにコピーするだけでは復号できません。他の環境では権限を制限した Fernet キーファイルを使用します。削除操作は現在の入力も空にし、自動保存とモデルキャッシュを解除します。環境変数のキーは独立した設定で、新しいセッションで再読み込みされる場合があります。翻訳メモリとタスクファイルには読める字幕テキストが含まれます。
+
+検証コマンド：
+
+```powershell
+uv sync --locked --all-groups
+uv run playwright install chromium
+uv run pytest -m "not e2e"
+uv run pytest -m e2e --tracing retain-on-failure --screenshot only-on-failure
+```
+
+GitHub Actions は push/PR 時に Windows/Linux のコアテストと Linux Chromium の操作テストを実行します。ブラウザテストはローカル模擬 API を使用し、実際のキーや有料 API 呼び出しは不要です。失敗時にはスクリーンショットと trace を保存します。すべての実サービスや字幕効果の動作保証ではありません。
 
 ### 0. 読み方
 
@@ -922,6 +994,8 @@ LLM 系：
 
 詳細は `.env.example` を参照してください。
 
+追加設定：`APP_MAX_BATCH_CHARS` は既定 `6000`、最小 `100` です。
+
 ---
 
 ### 11. 用語集 CSV
@@ -960,7 +1034,7 @@ source,target,notes
 
 注意：
 
-- 2つのファイルをセットで保持してください
+- 2つのファイルをセットで保持してください。Windows では元ユーザーの DPAPI 環境も必要です
 - `secret_store.key` 紛失時、過去データは復号不可です
 
 ---

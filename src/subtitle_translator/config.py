@@ -16,6 +16,7 @@ class AppConfig:
     batch_size: int
     max_file_size_bytes: int
     request_timeout_seconds: float
+    max_batch_chars: int = 6000
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -32,6 +33,7 @@ class AppConfig:
             batch_size=max(1, int(os.getenv("APP_BATCH_SIZE", "20"))),
             max_file_size_bytes=max(1, int(os.getenv("APP_MAX_FILE_SIZE_MB", "5"))) * 1024 * 1024,
             request_timeout_seconds=max(5.0, float(os.getenv("APP_REQUEST_TIMEOUT_SECONDS", "60"))),
+            max_batch_chars=max(100, int(os.getenv('APP_MAX_BATCH_CHARS', '6000'))),
         )
 
     def ensure_runtime_dirs(self) -> None:

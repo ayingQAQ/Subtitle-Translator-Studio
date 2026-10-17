@@ -6,6 +6,6 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-call uv run --locked python launcher.py
+call uv run --locked --no-dev python launcher.py
 if errorlevel 1 pause
 

@@ -7,7 +7,8 @@ import streamlit as st
 
 from subtitle_translator.config import AppConfig
 from subtitle_translator.glossary import GlossaryFormatError, parse_glossary_csv
-from subtitle_translator.memory import TranslationMemory
+from subtitle_translator.identity import connection_identity
+from subtitle_translator.jobs import TranslationJob, restore_checkpoint, save_checkpoint
 from subtitle_translator.secret_store import SecretStore, SecretStoreError
 from subtitle_translator.subtitle_io import (
     IMAGE_SUBTITLE_EXTENSIONS,
@@ -15,11 +16,11 @@ from subtitle_translator.subtitle_io import (
     export_subtitle_document,
     format_timestamp,
     load_subtitle_document,
+    apply_subtitle_edits,
 )
 from subtitle_translator.translator import (
     ProviderSettings,
     TranslationError,
-    TranslationService,
     build_translator_provider,
     get_provider_spec,
     get_provider_specs,
@@ -328,11 +329,20 @@ def run() -> None:
         st.error(_tr(ui_lang, "图片字幕格式不在此项目支持范围。", "画像字幕形式はこのプロジェクトではサポート対象外です。", "Image subtitle formats are not supported in this project."))
         return
 
-    document, parse_error = _get_cached_document(uploaded_file.name, file_bytes, file_hash)
+    encoding_options = ['Auto', 'utf-8-sig', 'utf-8', 'cp932', 'gb18030', 'big5', 'utf-16', 'utf-16-le', 'utf-16-be']
+    selected_encoding = st.selectbox(
+        _tr(ui_lang, '读取编码', '入力エンコード', 'Input encoding'), encoding_options,
+        help=_tr(ui_lang, '原文乱码时手动选择编码。', '文字化け時は手動で選択。', 'Choose manually if the source preview is garbled.'),
+    )
+    forced_encoding = None if selected_encoding == 'Auto' else selected_encoding
+    document, parse_error = _get_cached_document(uploaded_file.name, file_bytes, file_hash, forced_encoding)
     if parse_error:
         st.error(parse_error)
         return
     assert document is not None
+    with st.expander(_tr(ui_lang, '原文预览（请先检查乱码）', '原文プレビュー', 'Source preview (check encoding)'), expanded=True):
+        st.caption(f'{document.encoding} | {repr(document.newline)}')
+        st.dataframe([{'#': s.index + 1, 'Source': s.plain_text} for s in document.segments[:5]], hide_index=True)
 
     source_col, target_col = st.columns([1, 1])
     source_options = SOURCE_LANGUAGE_OPTIONS[ui_lang]
@@ -362,7 +372,7 @@ def run() -> None:
     _render_file_summary(document, ui_lang)
 
     request_signature = _build_request_signature(
-        file_hash=file_hash,
+        file_hash=hashlib.sha256((file_hash + uploaded_file.name + document.encoding + connection_identity(provider_settings)).encode()).hexdigest(),
         source_language=source_options[source_label],
         target_language=target_options[target_label],
         provider_id=provider_spec.provider_id,
@@ -371,6 +381,15 @@ def run() -> None:
         glossary_hash=glossary_hash,
     )
     _reset_result_if_request_changed(request_signature)
+    if (config.db_path.parent / 'jobs' / f'{request_signature}.json').exists():
+        st.caption(_tr(ui_lang, '检测到已保存任务，开始翻译会继续未完成部分。', '保存済みタスクから再開します。', 'Saved task found. Start Translation resumes unfinished items.'))
+
+    active_job = st.session_state.get('translation_job')
+    if active_job and active_job['signature'] != request_signature and active_job['job'].snapshot()['status'] == 'running':
+        st.warning(_tr(ui_lang, '上一任务仍在运行，请先取消后再更换配置。', '前のタスクを中止してください。', 'Cancel the running task before changing configuration.'))
+        if st.button(_tr(ui_lang, '取消上一任务', '前のタスクを中止', 'Cancel previous task')):
+            active_job['job'].cancel()
+        return
 
     missing_requirements = _validate_provider_settings(provider_settings, provider_spec, require_model=True, ui_lang=ui_lang)
     if missing_requirements:
@@ -378,7 +397,8 @@ def run() -> None:
 
     with st.container(border=True):
         start_disabled = bool(missing_requirements)
-        start_clicked = st.button(_tr(ui_lang, "开始翻译", "翻訳開始", "Start Translation"), type="primary", disabled=start_disabled)
+        running = bool(active_job and active_job['job'].snapshot()['status'] == 'running')
+        start_clicked = st.button(_tr(ui_lang, "开始翻译", "翻訳開始", "Start Translation"), type="primary", disabled=start_disabled or running)
         if start_clicked:
             _run_translation(
                 config=config,
@@ -392,9 +412,10 @@ def run() -> None:
                 ui_lang=ui_lang,
             )
 
-    result = st.session_state.get("translation_result")
-    if result and result.get("request_signature") == request_signature:
-        _render_result(result["document"], result["exported"], result["provider_name"], ui_lang)
+    active_job = st.session_state.get('translation_job')
+    if active_job and active_job['signature'] == request_signature:
+        _render_job(active_job, config, provider_spec, provider_settings, document,
+                    source_options[source_label], target_options[target_label], glossary_terms, ui_lang)
 
 
 def _render_provider_panel(config: AppConfig, ui_lang: str, secret_store: SecretStore):
@@ -477,16 +498,17 @@ def _render_provider_panel(config: AppConfig, ui_lang: str, secret_store: Secret
             base_url = st.text_input("Base URL", value=base_default, key=f"{provider_id}_base_url")
 
             model_cache = st.session_state.get("provider_model_cache", {})
-            fetched_models = model_cache.get(provider_id, [])
+            model_identity = connection_identity(ProviderSettings(provider_id, api_key, base_url=base_url))
+            fetched_models = model_cache.get(model_identity, [])
             if fetched_models:
                 custom_label = _tr(ui_lang, "自定义输入...", "手動入力...", "Custom input...")
                 selector_options = fetched_models + [custom_label]
-                selected_default = model_default if model_default in fetched_models else custom_label
+                selected_default = model_default if model_default in fetched_models else fetched_models[0]
                 selected_model = st.selectbox(
                     _tr(ui_lang, "模型（已从接口获取）", "モデル（API 取得済み）", "Model (from API)"),
                     selector_options,
                     index=selector_options.index(selected_default),
-                    key=f"{provider_id}_model_selector",
+                    key=f"model_selector_{model_identity}",
                 )
                 if selected_model == custom_label:
                     model_name = st.text_input(
@@ -545,6 +567,8 @@ def _render_provider_panel(config: AppConfig, ui_lang: str, secret_store: Secret
                 _tr(ui_lang, "清除密钥", "キー削除", "Clear key"),
                 use_container_width=True,
                 key=f"{provider_id}_clear_key_now",
+                on_click=_clear_saved_key,
+                args=(secret_store, secret_id, provider_id),
             )
 
         if save_now:
@@ -601,7 +625,7 @@ def _render_provider_panel(config: AppConfig, ui_lang: str, secret_store: Secret
                         )
                 if spec.family == "llm" and models:
                     model_cache = st.session_state.get("provider_model_cache", {})
-                    model_cache[provider_id] = models
+                    model_cache[connection_identity(settings)] = models
                     st.session_state["provider_model_cache"] = model_cache
                     st.session_state["provider_probe_notice"] = _tr(
                         ui_lang,
@@ -622,7 +646,30 @@ def _render_provider_panel(config: AppConfig, ui_lang: str, secret_store: Secret
                     )
                 )
 
+        if st.button(_tr(ui_lang, '试译一句（可能计费）', '試し翻訳（課金の場合あり）', 'Test translation (may incur cost)'),
+                     disabled=bool(_validate_provider_settings(settings, spec, ui_lang=ui_lang))):
+            provider = None
+            try:
+                provider = build_translator_provider(settings)
+                sample = provider.translate_batch(['Hello, how are you?'], source_language='en', target_language='zh', glossary=[])
+                st.success(sample[0])
+            except Exception as exc:
+                st.error(str(exc) if isinstance(exc, TranslationError) else type(exc).__name__)
+            finally:
+                if provider and hasattr(provider, '_client'):
+                    provider._client.close()
+
     return spec, settings
+
+
+def _clear_saved_key(store, secret_id, provider_id):
+    try:
+        store.delete(secret_id)
+        st.session_state[f'{provider_id}_api_key'] = ''
+        st.session_state[f'{provider_id}_remember_key'] = False
+        st.session_state['provider_model_cache'] = {}
+    except SecretStoreError as exc:
+        st.session_state['provider_probe_notice'] = str(exc)
 
 
 def _run_translation(
@@ -637,40 +684,73 @@ def _run_translation(
     request_signature: str,
     ui_lang: str,
 ) -> None:
-    progress_placeholder = st.empty()
-    status_placeholder = st.empty()
-    progress_bar = st.progress(0.0, text=_tr(ui_lang, "准备中...", "準備中...", "Preparing..."))
-
-    def on_progress(completed: int, total: int, message: str) -> None:
-        ratio = completed / total if total else 1.0
-        progress_bar.progress(ratio, text=_tr(ui_lang, f"{completed}/{total} 已完成", f"{completed}/{total} 完了", f"{completed}/{total} done"))
-        status_placeholder.info(message)
-
+    checkpoint = config.db_path.parent / 'jobs' / f'{request_signature}.json'
     try:
-        provider = build_translator_provider(provider_settings)
-        working_doc = copy.deepcopy(document)
-        with TranslationMemory(config.db_path) as memory:
-            service = TranslationService(provider, memory, batch_size=config.batch_size)
-            translated_document = service.translate_document(
-                working_doc,
-                source_language=source_language,
-                target_language=target_language,
-                glossary=glossary_terms,
-                progress_callback=on_progress,
-            )
-        exported = export_subtitle_document(translated_document, target_language=target_language)
-    except (TranslationError, SubtitleIOError) as exc:
-        progress_placeholder.empty()
-        st.error(str(exc))
+        restored, _ = restore_checkpoint(checkpoint, copy.deepcopy(document))
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+        st.error(f'Cannot restore task checkpoint: {exc}')
         return
-
-    progress_placeholder.success(_tr(ui_lang, "翻译完成。", "翻訳が完了しました。", "Translation completed."))
-    st.session_state["translation_result"] = {
-        "request_signature": request_signature,
-        "document": translated_document,
-        "exported": exported,
-        "provider_name": provider_spec.display_name,
+    try:
+        job = TranslationJob(restored, provider_settings, config, source_language,
+                             target_language, glossary_terms, checkpoint).start()
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+        st.error(f'Cannot resume task: {exc}')
+        return
+    st.session_state.pop('translation_result', None)
+    st.session_state['translation_job'] = {
+        'signature': request_signature, 'job': job, 'target': target_language,
     }
+    st.rerun()
+
+
+@st.fragment(run_every=1)
+def _render_job(active, config, spec, settings, document, source, target, glossary, ui_lang):
+    snapshot = active['job'].snapshot()
+    status = snapshot['status']
+    total = snapshot['total']
+    st.progress(snapshot['completed'] / total if total else 0,
+                text=f"{snapshot['completed']}/{total}")
+    labels = {
+        'running': ('正在翻译', '翻訳中', 'Translating'),
+        'completed': ('翻译完成', '翻訳完了', 'Translation completed'),
+        'failed': ('有失败项，可重试', '失敗した字幕を再試行できます', 'Failed items can be retried'),
+        'cancelled': ('已取消，完成结果已保存', '中止済み・結果保存済み', 'Cancelled; completed results saved'),
+    }
+    st.info(_tr(ui_lang, *labels[status]))
+    if snapshot['error']:
+        st.error(snapshot['error'])
+    if status == 'running':
+        if snapshot['cancelling']:
+            st.info(_tr(ui_lang, '正在取消，等待当前请求返回…', 'リクエスト終了後に中止します…', 'Cancelling after current request...'))
+        elif st.button(_tr(ui_lang, '取消翻译', '翻訳を中止', 'Cancel translation')):
+            active['job'].cancel()
+            st.rerun(scope='fragment')
+        return
+    if snapshot['failures']:
+        st.dataframe([{'#': i + 1, 'Error': error} for i, error in snapshot['failures'].items()], hide_index=True)
+    if status in ('cancelled', 'failed'):
+        if st.button(_tr(ui_lang, '继续未完成 / 仅重试失败项', '未完了・失敗項目を再試行', 'Resume / retry failed items')):
+            _run_translation(config=config, provider_spec=spec, provider_settings=settings,
+                             document=document, source_language=source, target_language=target,
+                             glossary_terms=glossary, request_signature=active['signature'], ui_lang=ui_lang)
+    completed_doc = snapshot['document']
+    result = st.session_state.get('translation_result')
+    if not result or result['request_signature'] != active['signature']:
+        checkpoint = config.db_path.parent / 'jobs' / f"{active['signature']}.json"
+        try:
+            completed_doc, _ = restore_checkpoint(checkpoint, completed_doc)
+        except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+            st.error(f'Cannot read saved edits: {exc}')
+            return
+        result = {'request_signature': active['signature'], 'document': completed_doc,
+                  'exported': export_subtitle_document(completed_doc, target_language=target),
+                  'provider_name': spec.display_name, 'target': target,
+                  'checkpoint': checkpoint,
+                  'failures': snapshot['failures']}
+        st.session_state['translation_result'] = result
+    if status != 'completed':
+        st.warning(_tr(ui_lang, '部分结果：未完成行仍保留原文。', '未完了行は原文です。', 'Partial result: unfinished lines retain source text.'))
+    _render_result(result['document'], result['exported'], result['provider_name'], ui_lang)
 
 
 def _render_result(translated_document, exported, provider_name: str, ui_lang: str) -> None:
@@ -683,15 +763,39 @@ def _render_result(translated_document, exported, provider_name: str, ui_lang: s
             "Start": format_timestamp(segment.start_ms),
             "End": format_timestamp(segment.end_ms),
             "Source": segment.plain_text,
-            "Translation": segment.translated_text or "",
+            "Translation": segment.translated_raw_text if segment.translated_raw_text is not None else segment.raw_text,
         }
         for segment in translated_document.segments
         if segment.is_translatable
     ]
     max_rows = len(rows)
     default_rows = min(300, max_rows) if max_rows > 0 else 0
-    preview_count = st.slider(_tr(ui_lang, "预览行数", "プレビュー行数", "Preview rows"), min_value=0, max_value=max_rows, value=default_rows, step=50)
-    st.dataframe(rows[:preview_count], use_container_width=True, height=460)
+    preview_count = st.slider(_tr(ui_lang, "预览行数", "プレビュー行数", "Preview rows"), min_value=0, max_value=max(1, max_rows), value=default_rows, step=1)
+    st.caption(_tr(ui_lang, '可编辑译文；保留行内样式标签和换行标记。', '訳文を編集できます。タグを維持してください。', 'Edit translations; preserve inline tags and newline markers.'))
+    edited = st.data_editor(rows[:preview_count], disabled=['#', 'Start', 'End', 'Source'],
+                            hide_index=True, height=460,
+                            key='translation_editor_' + st.session_state['translation_result']['request_signature'])
+    if st.button(_tr(ui_lang, '应用修改并更新下载', '変更を適用', 'Apply edits and update download')):
+        try:
+            exported = _save_user_edits(translated_document, {row['#'] - 1: row['Translation'] for row in edited})
+            st.success(_tr(ui_lang, '修改已应用。', '適用しました。', 'Edits applied.'))
+        except (SubtitleIOError, TypeError, OSError) as exc:
+            st.error(str(exc))
+
+    if rows:
+        with st.expander(_tr(ui_lang, '按编号编辑字幕', '番号で字幕を編集', 'Edit one subtitle')):
+            number = st.selectbox(_tr(ui_lang, '字幕编号', '字幕番号', 'Subtitle number'), [row['#'] for row in rows])
+            segment = translated_document.segments[number - 1]
+            signature = st.session_state['translation_result']['request_signature']
+            text = st.text_area(_tr(ui_lang, '译文文本', '訳文テキスト', 'Translation text'),
+                                value=segment.translated_raw_text if segment.translated_raw_text is not None else segment.raw_text,
+                                key=f'line_editor_{signature}_{number}')
+            if st.button(_tr(ui_lang, '应用单条修改', 'この字幕に適用', 'Apply single edit')):
+                try:
+                    exported = _save_user_edits(translated_document, {number - 1: text})
+                    st.success(_tr(ui_lang, '修改已应用。', '適用しました。', 'Edits applied.'))
+                except (SubtitleIOError, TypeError, OSError) as exc:
+                    st.error(str(exc))
 
     st.download_button(
         label=_tr(ui_lang, f"下载 {exported.file_name}", f"ダウンロード {exported.file_name}", f"Download {exported.file_name}"),
@@ -700,6 +804,19 @@ def _render_result(translated_document, exported, provider_name: str, ui_lang: s
         mime="text/plain",
     )
     st.caption(_tr(ui_lang, f"导出编码：`{exported.encoding}`", f"出力エンコード: `{exported.encoding}`", f"Export encoding: `{exported.encoding}`"))
+
+
+def _save_user_edits(document, edits):
+    working = copy.deepcopy(document)
+    apply_subtitle_edits(working, edits)
+    result = st.session_state['translation_result']
+    exported = export_subtitle_document(working, target_language=result['target'])
+    remaining = {i: message for i, message in result['failures'].items()
+                 if working.segments[i].translated_raw_text is None}
+    save_checkpoint(result['checkpoint'], working, remaining)
+    result['document'] = working
+    result['exported'] = exported
+    return exported
 
 
 def _render_file_summary(document, ui_lang: str) -> None:
@@ -775,15 +892,16 @@ def _reset_result_if_request_changed(request_signature: str) -> None:
         st.session_state.pop("translation_result", None)
 
 
-def _get_cached_document(file_name: str, file_bytes: bytes, file_hash: str):
+def _get_cached_document(file_name: str, file_bytes: bytes, file_hash: str, encoding: str | None = None):
     cache = st.session_state.get("document_cache", {})
-    if file_hash in cache:
-        return cache[file_hash], None
+    cache_key = (file_name, file_hash, encoding)
+    if cache_key in cache:
+        return cache[cache_key], None
     try:
-        document = load_subtitle_document(file_name, file_bytes)
+        document = load_subtitle_document(file_name, file_bytes, encoding)
     except SubtitleIOError as exc:
         return None, str(exc)
-    cache[file_hash] = document
+    cache[cache_key] = document
     if len(cache) > 3:
         first_key = next(iter(cache))
         cache.pop(first_key, None)

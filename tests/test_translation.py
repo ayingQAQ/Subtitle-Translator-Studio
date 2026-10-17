@@ -75,3 +75,14 @@ def test_utf16_bom_newline():
 
 def test_batches_bound_length_and_count():
     assert list(bounded_batches(['aaaa', 'bbbb', 'cc'], 3, 6)) == [['aaaa'], ['bbbb', 'cc']]
+
+
+def test_oversized_line_is_split_without_losing_tags(tmp_path):
+    doc = load_subtitle_document('long.srt', ('1\n00:00:01,000 --> 00:00:02,000\n<i>' + 'a' * 250 + '</i>\n\n').encode())
+    provider = Provider()
+    with TranslationMemory(tmp_path / 'memory.db') as memory:
+        service = TranslationService(provider, memory, max_batch_chars=100)
+        service.translate_document(doc, source_language='en', target_language='zh', glossary=[])
+    assert max(map(len, provider.calls)) <= 100
+    assert doc.segments[0].translated_raw_text.startswith('<i>')
+    assert doc.segments[0].translated_raw_text.endswith('</i>')
